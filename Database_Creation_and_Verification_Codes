@@ -1,0 +1,1080 @@
+-- 1. users
+-- Purpose: Stores users who sign in through GitHub.
+-- Each user gets a unique internal user_id. We also store their GitHub ID and basic profile information.
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE users (
+    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    github_id BIGINT UNIQUE NOT NULL,
+    github_username VARCHAR(255) NOT NULL,
+
+    email VARCHAR(255),
+    avatar_url TEXT,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+-- 2. repositories
+-- Purpose: Stores information about every unique GitHub repository connected to our application.
+-- A repository is stored only once, even if multiple users connect to it.
+
+CREATE TABLE repositories (
+    repo_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    github_repo_id BIGINT UNIQUE NOT NULL,
+    repo_name VARCHAR(255) NOT NULL,
+    full_name VARCHAR(500) NOT NULL,
+
+    description TEXT,
+    default_branch VARCHAR(255),
+    visibility VARCHAR(20),
+    clone_url TEXT NOT NULL,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. user_repositories
+-- Purpose: Establishes the many-to-many relationship between users and repositories.
+-- A user can access multiple repositories, and one repository can be shared by multiple users.
+
+CREATE TABLE user_repositories (
+    user_id UUID REFERENCES users(user_id)
+        ON DELETE CASCADE,
+
+    repo_id UUID REFERENCES repositories(repo_id)
+        ON DELETE CASCADE,
+
+    PRIMARY KEY (user_id, repo_id)
+);
+
+-- 4. repository_database_registry
+-- Purpose: Maps each GitHub repository to its dedicated PostgreSQL RKB database.
+-- When another user connects to an already registered repository, our backend finds the existing database and reuses it.
+
+CREATE TABLE repository_database_registry (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    repo_id UUID NOT NULL UNIQUE,
+    database_name VARCHAR(255) NOT NULL UNIQUE,
+
+    status VARCHAR(30) NOT NULL DEFAULT 'PROVISIONING',
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT fk_repo
+        FOREIGN KEY (repo_id)
+        REFERENCES repositories(repo_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT valid_status
+        CHECK (status IN ('PROVISIONING', 'READY', 'FAILED'))
+);
+
+
+-- 5. files
+-- Purpose: Stores metadata about every file in the repository.
+-- We use this table to identify files, detect changes and connect files to their code entities.
+
+CREATE TABLE files (
+    file_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    file_path TEXT UNIQUE NOT NULL,
+    file_name VARCHAR(255) NOT NULL,
+
+    extension VARCHAR(50),
+    language VARCHAR(100),
+
+    content_hash VARCHAR(64),
+    size_bytes BIGINT,
+
+    is_deleted BOOLEAN DEFAULT FALSE,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 6. symbols
+-- Purpose: Stores code entities extracted from files using Tree-sitter.
+-- A symbol can be a class, function, method, or another code entity we decide to support.
+
+CREATE TABLE symbols (
+    symbol_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    file_id UUID NOT NULL
+        REFERENCES files(file_id)
+        ON DELETE CASCADE,
+
+    parent_symbol_id UUID
+        REFERENCES symbols(symbol_id)
+        ON DELETE CASCADE,
+
+    symbol_name VARCHAR(255) NOT NULL,
+    qualified_name TEXT NOT NULL,
+
+    symbol_type VARCHAR(50) NOT NULL,
+
+    signature TEXT,
+
+    start_line INTEGER,
+    end_line INTEGER,
+
+    visibility VARCHAR(30),
+    docstring TEXT,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+-- 7. relationships
+-- Purpose: Stores connections between files and code symbols.
+-- This is the foundation of our dependency graph and impact analysis.
+
+CREATE TABLE relationships (
+    relationship_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    source_file_id UUID
+        REFERENCES files(file_id) ON DELETE CASCADE,
+
+    target_file_id UUID
+        REFERENCES files(file_id) ON DELETE CASCADE,
+
+    source_symbol_id UUID
+        REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+
+    target_symbol_id UUID
+        REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+
+    relationship_type VARCHAR(50) NOT NULL,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT valid_relationship_endpoints CHECK (
+        (
+            source_file_id IS NOT NULL
+            AND target_file_id IS NOT NULL
+            AND source_symbol_id IS NULL
+            AND target_symbol_id IS NULL
+        )
+        OR
+        (
+            source_file_id IS NULL
+            AND target_file_id IS NULL
+            AND source_symbol_id IS NOT NULL
+            AND target_symbol_id IS NOT NULL
+        )
+    )
+);
+
+-- 8. repository_versions
+-- Purpose: Tracks successfully built RKB versions.
+-- We decided to maintain the latest successfully built RKB as active, while keeping previous version records for tracking.
+
+CREATE TABLE repository_versions (
+    version_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    commit_sha VARCHAR(40) NOT NULL,
+    branch_name VARCHAR(255),
+
+    scan_status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+
+    is_active BOOLEAN DEFAULT FALSE,
+
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT valid_version_status
+        CHECK (scan_status IN (
+            'PENDING',
+            'IN_PROGRESS',
+            'COMPLETED',
+            'FAILED'
+        ))
+);
+
+CREATE UNIQUE INDEX one_active_version
+ON repository_versions(is_active)
+WHERE is_active = TRUE;
+
+-- 9. scan_history
+-- Purpose: Records every scanning attempt, including unsuccessful attempts.
+-- This is useful for debugging, monitoring and understanding scan failures.
+
+CREATE TABLE scan_history (
+    scan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    commit_sha VARCHAR(40) NOT NULL,
+    branch_name VARCHAR(255),
+
+    scan_type VARCHAR(30) NOT NULL,
+    scan_status VARCHAR(30) NOT NULL,
+
+    error_message TEXT,
+
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+-- 10. unresolved_references
+-- Purpose: Stores code references that our dependency resolver cannot confidently identify.
+-- For example, when our resolver sees obj.calculate() but cannot determine which class's calculate() method is called, we record it here.
+
+CREATE TABLE unresolved_references (
+    reference_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    source_symbol_id UUID NOT NULL
+        REFERENCES symbols(symbol_id)
+        ON DELETE CASCADE,
+
+    reference_name VARCHAR(255) NOT NULL,
+    reference_type VARCHAR(50),
+
+    line_number INTEGER,
+
+    resolution_status VARCHAR(30) DEFAULT 'UNRESOLVED',
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT valid_resolution_status
+        CHECK (resolution_status IN (
+            'UNRESOLVED',
+            'AMBIGUOUS'
+        ))
+);
+
+INSERT INTO repositories (
+    github_repo_id,
+    repo_name,
+    full_name,
+    description,
+    default_branch,
+    visibility,
+    clone_url
+)
+VALUES
+(
+    50001,
+    'AI-PR-Reviewer',
+    'ashirwad/AI-PR-Reviewer',
+    'AI-powered pull request reviewer',
+    'main',
+    'private',
+    'https://github.com/ashirwad/AI-PR-Reviewer.git'
+),
+(
+    50002,
+    'Plant-Disease-Detection',
+    'ashirwad/Plant-Disease-Detection',
+    'Plant disease classification project',
+    'main',
+    'public',
+    'https://github.com/ashirwad/Plant-Disease-Detection.git'
+);
+
+
+INSERT INTO user_repositories (user_id, repo_id)
+SELECT u.user_id, r.repo_id
+FROM users u
+CROSS JOIN repositories r
+WHERE
+    (u.github_username = 'ashirwad'
+     AND r.repo_name IN (
+         'AI-PR-Reviewer',
+         'Plant-Disease-Detection'
+     ))
+    OR
+    (u.github_username = 'ankit'
+     AND r.repo_name = 'AI-PR-Reviewer');
+
+
+
+INSERT INTO repository_database_registry (
+    repo_id,
+    database_name,
+    status
+)
+SELECT
+    repo_id,
+    CASE
+        WHEN repo_name = 'AI-PR-Reviewer'
+            THEN 'rkb_repo_001'
+        WHEN repo_name = 'Plant-Disease-Detection'
+            THEN 'rkb_repo_002'
+    END,
+    'READY'
+FROM repositories
+WHERE repo_name IN (
+    'AI-PR-Reviewer',
+    'Plant-Disease-Detection'
+);
+
+
+
+SELECT
+    r.full_name,
+    r.github_repo_id,
+    d.database_name,
+    d.status
+FROM repositories r
+JOIN repository_database_registry d
+    ON r.repo_id = d.repo_id;
+
+
+
+
+BEGIN;
+
+-- 1. files
+ALTER TABLE files
+ADD COLUMN repo_id UUID NOT NULL
+REFERENCES repositories(repo_id)
+ON DELETE CASCADE;
+
+-- File paths should be unique within a repository,
+-- not across all repositories.
+ALTER TABLE files
+DROP CONSTRAINT IF EXISTS files_file_path_key;
+
+ALTER TABLE files
+ADD CONSTRAINT unique_repo_file_path
+UNIQUE (repo_id, file_path);
+
+
+-- 2. symbols
+ALTER TABLE symbols
+ADD COLUMN repo_id UUID NOT NULL
+REFERENCES repositories(repo_id)
+ON DELETE CASCADE;
+
+
+-- 3. relationships
+ALTER TABLE relationships
+ADD COLUMN repo_id UUID NOT NULL
+REFERENCES repositories(repo_id)
+ON DELETE CASCADE;
+
+
+-- 4. repository_versions
+ALTER TABLE repository_versions
+ADD COLUMN repo_id UUID NOT NULL
+REFERENCES repositories(repo_id)
+ON DELETE CASCADE;
+
+-- Only one active RKB version per repository,
+-- not one active version across all repositories.
+DROP INDEX IF EXISTS one_active_version;
+
+CREATE UNIQUE INDEX one_active_version_per_repo
+ON repository_versions(repo_id)
+WHERE is_active = TRUE;
+
+
+-- 5. scan_history
+ALTER TABLE scan_history
+ADD COLUMN repo_id UUID NOT NULL
+REFERENCES repositories(repo_id)
+ON DELETE CASCADE;
+
+
+-- 6. unresolved_references
+ALTER TABLE unresolved_references
+ADD COLUMN repo_id UUID NOT NULL
+REFERENCES repositories(repo_id)
+ON DELETE CASCADE;
+
+COMMIT;
+
+
+
+
+SELECT
+    table_name,
+    column_name,
+    data_type
+FROM information_schema.columns
+WHERE table_schema = 'public'
+AND column_name = 'repo_id'
+ORDER BY table_name;
+
+
+BEGIN;
+
+-- Allow files to be referenced using repo_id + file_id
+ALTER TABLE files
+ADD CONSTRAINT unique_repo_file_id
+UNIQUE (repo_id, file_id);
+
+-- Remove the old single-column foreign key
+ALTER TABLE symbols
+DROP CONSTRAINT IF EXISTS symbols_file_id_fkey;
+
+-- Add repository-aware foreign key
+ALTER TABLE symbols
+ADD CONSTRAINT fk_symbols_repository_file
+FOREIGN KEY (repo_id, file_id)
+REFERENCES files(repo_id, file_id)
+ON DELETE CASCADE;
+
+COMMIT;
+
+
+BEGIN;
+
+-- Allow symbols to be referenced using repo_id + symbol_id
+ALTER TABLE symbols
+ADD CONSTRAINT unique_repo_symbol_id
+UNIQUE (repo_id, symbol_id);
+
+-- Remove the old self-referencing foreign key
+ALTER TABLE symbols
+DROP CONSTRAINT IF EXISTS symbols_parent_symbol_id_fkey;
+
+-- Add repository-aware self-referencing foreign key
+ALTER TABLE symbols
+ADD CONSTRAINT fk_symbols_parent_same_repo
+FOREIGN KEY (repo_id, parent_symbol_id)
+REFERENCES symbols(repo_id, symbol_id)
+ON DELETE CASCADE;
+
+COMMIT;
+
+
+BEGIN;
+
+-- Remove existing single-column foreign keys
+ALTER TABLE relationships
+DROP CONSTRAINT IF EXISTS relationships_source_file_id_fkey;
+
+ALTER TABLE relationships
+DROP CONSTRAINT IF EXISTS relationships_target_file_id_fkey;
+
+ALTER TABLE relationships
+DROP CONSTRAINT IF EXISTS relationships_source_symbol_id_fkey;
+
+ALTER TABLE relationships
+DROP CONSTRAINT IF EXISTS relationships_target_symbol_id_fkey;
+
+
+-- File-to-file relationships
+ALTER TABLE relationships
+ADD CONSTRAINT fk_relationship_source_file
+FOREIGN KEY (repo_id, source_file_id)
+REFERENCES files(repo_id, file_id)
+ON DELETE CASCADE;
+
+ALTER TABLE relationships
+ADD CONSTRAINT fk_relationship_target_file
+FOREIGN KEY (repo_id, target_file_id)
+REFERENCES files(repo_id, file_id)
+ON DELETE CASCADE;
+
+
+-- Symbol-to-symbol relationships
+ALTER TABLE relationships
+ADD CONSTRAINT fk_relationship_source_symbol
+FOREIGN KEY (repo_id, source_symbol_id)
+REFERENCES symbols(repo_id, symbol_id)
+ON DELETE CASCADE;
+
+ALTER TABLE relationships
+ADD CONSTRAINT fk_relationship_target_symbol
+FOREIGN KEY (repo_id, target_symbol_id)
+REFERENCES symbols(repo_id, symbol_id)
+ON DELETE CASCADE;
+
+COMMIT;
+
+
+BEGIN;
+
+-- Remove the old foreign key
+ALTER TABLE unresolved_references
+DROP CONSTRAINT IF EXISTS
+    unresolved_references_source_symbol_id_fkey;
+
+-- Add repository-aware foreign key
+ALTER TABLE unresolved_references
+ADD CONSTRAINT fk_unresolved_reference_same_repo
+FOREIGN KEY (repo_id, source_symbol_id)
+REFERENCES symbols(repo_id, symbol_id)
+ON DELETE CASCADE;
+
+COMMIT;
+
+
+
+BEGIN;
+
+-- Allow a scan to reference a version from the same repository
+ALTER TABLE repository_versions
+ADD CONSTRAINT unique_repo_version
+UNIQUE (repo_id, version_id);
+
+-- Store the resulting version in scan history
+ALTER TABLE scan_history
+ADD COLUMN version_id UUID;
+
+-- Enforce that the scan and its version belong to the same repo
+ALTER TABLE scan_history
+ADD CONSTRAINT fk_scan_history_version
+FOREIGN KEY (repo_id, version_id)
+REFERENCES repository_versions(repo_id, version_id)
+ON DELETE SET NULL (version_id);
+
+COMMIT;
+
+
+BEGIN;
+
+-- Active status should never be NULL
+ALTER TABLE repository_versions
+ALTER COLUMN is_active SET DEFAULT FALSE;
+
+ALTER TABLE repository_versions
+ALTER COLUMN is_active SET NOT NULL;
+
+-- Only completed versions can become active
+ALTER TABLE repository_versions
+ADD CONSTRAINT active_version_must_be_completed
+CHECK (
+    is_active = FALSE
+    OR scan_status = 'COMPLETED'
+);
+
+COMMIT;
+
+
+
+BEGIN;
+
+-- SYMBOLS
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_file
+ON symbols(repo_id, file_id);
+
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_parent
+ON symbols(repo_id, parent_symbol_id);
+
+
+-- RELATIONSHIPS
+CREATE INDEX IF NOT EXISTS idx_rel_source_file
+ON relationships(repo_id, source_file_id);
+
+CREATE INDEX IF NOT EXISTS idx_rel_target_file
+ON relationships(repo_id, target_file_id);
+
+CREATE INDEX IF NOT EXISTS idx_rel_source_symbol
+ON relationships(repo_id, source_symbol_id);
+
+CREATE INDEX IF NOT EXISTS idx_rel_target_symbol
+ON relationships(repo_id, target_symbol_id);
+
+
+-- REPOSITORY VERSIONS
+CREATE INDEX IF NOT EXISTS idx_versions_repo_created
+ON repository_versions(repo_id, created_at DESC);
+
+
+-- SCAN HISTORY
+CREATE INDEX IF NOT EXISTS idx_scan_history_repo_created
+ON scan_history(repo_id, started_at DESC);
+
+
+-- UNRESOLVED REFERENCES
+CREATE INDEX IF NOT EXISTS idx_unresolved_repo_symbol
+ON unresolved_references(repo_id, source_symbol_id);
+
+COMMIT;
+
+
+
+SELECT
+    table_name,
+    column_name,
+    data_type,
+    is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'public'
+AND table_name IN (
+    'files',
+    'symbols',
+    'relationships',
+    'repository_versions',
+    'scan_history',
+    'unresolved_references'
+)
+AND column_name = 'repo_id'
+ORDER BY table_name;
+
+
+INSERT INTO files (
+    repo_id,
+    file_path,
+    file_name,
+    extension,
+    language,
+    size_bytes
+)
+SELECT
+    repo_id,
+    'test/main.py',
+    'main.py',
+    '.py',
+    'Python',
+    1024
+FROM repositories
+WHERE full_name = 'ashirwad/AI-PR-Reviewer'
+
+UNION ALL
+
+SELECT
+    repo_id,
+    'test/main.py',
+    'main.py',
+    '.py',
+    'Python',
+    2048
+FROM repositories
+WHERE full_name = 'ashirwad/Plant-Disease-Detection';
+
+
+SELECT
+    r.full_name,
+    f.file_id,
+    f.file_path,
+    f.size_bytes
+FROM files f
+JOIN repositories r ON f.repo_id = r.repo_id;
+
+
+
+INSERT INTO symbols (
+    repo_id,
+    file_id,
+    symbol_name,
+    qualified_name,
+    symbol_type
+)
+SELECT
+    f.repo_id,
+    f.file_id,
+    CASE
+        WHEN r.repo_name = 'AI-PR-Reviewer'
+            THEN 'AuthService'
+        ELSE 'DiseaseClassifier'
+    END,
+    CASE
+        WHEN r.repo_name = 'AI-PR-Reviewer'
+            THEN 'AuthService'
+        ELSE 'DiseaseClassifier'
+    END,
+    'CLASS'
+FROM files f
+JOIN repositories r ON r.repo_id = f.repo_id
+WHERE r.full_name IN (
+    'ashirwad/AI-PR-Reviewer',
+    'ashirwad/Plant-Disease-Detection'
+)
+AND f.file_path = 'test/main.py';
+
+
+SELECT
+    r.full_name,
+    s.symbol_name,
+    s.symbol_type,
+    f.file_path
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+JOIN files f ON f.file_id = s.file_id;
+
+
+
+
+INSERT INTO symbols (
+    repo_id,
+    file_id,
+    parent_symbol_id,
+    symbol_name,
+    qualified_name,
+    symbol_type
+)
+SELECT
+    s.repo_id,
+    s.file_id,
+    s.symbol_id,
+    'login',
+    'AuthService.login',
+    'METHOD'
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+AND s.symbol_name = 'AuthService'
+
+UNION ALL
+
+SELECT
+    s.repo_id,
+    s.file_id,
+    s.symbol_id,
+    'predict',
+    'DiseaseClassifier.predict',
+    'METHOD'
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+WHERE r.full_name = 'ashirwad/Plant-Disease-Detection'
+AND s.symbol_name = 'DiseaseClassifier';
+
+
+
+INSERT INTO symbols (
+    repo_id,
+    file_id,
+    parent_symbol_id,
+    symbol_name,
+    qualified_name,
+    symbol_type
+)
+SELECT
+    s.repo_id,
+    s.file_id,
+    s.symbol_id,
+    'validate',
+    'AuthService.validate',
+    'METHOD'
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+AND s.symbol_name = 'AuthService'
+AND s.symbol_type = 'CLASS'
+
+UNION ALL
+
+SELECT
+    s.repo_id,
+    s.file_id,
+    s.symbol_id,
+    'preprocess',
+    'DiseaseClassifier.preprocess',
+    'METHOD'
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+WHERE r.full_name = 'ashirwad/Plant-Disease-Detection'
+AND s.symbol_name = 'DiseaseClassifier'
+AND s.symbol_type = 'CLASS';
+
+INSERT INTO relationships (
+    repo_id,
+    source_symbol_id,
+    target_symbol_id,
+    relationship_type
+)
+SELECT
+    source.repo_id,
+    source.symbol_id,
+    target.symbol_id,
+    'CALLS'
+FROM symbols source
+JOIN symbols target
+    ON source.repo_id = target.repo_id
+JOIN repositories r
+    ON r.repo_id = source.repo_id
+WHERE
+    (
+        r.full_name = 'ashirwad/AI-PR-Reviewer'
+        AND source.qualified_name = 'AuthService.login'
+        AND target.qualified_name = 'AuthService.validate'
+    )
+    OR
+    (
+        r.full_name = 'ashirwad/Plant-Disease-Detection'
+        AND source.qualified_name = 'DiseaseClassifier.predict'
+        AND target.qualified_name = 'DiseaseClassifier.preprocess'
+    );
+
+
+
+SELECT
+    r.full_name,
+    source.qualified_name AS source_symbol,
+    target.qualified_name AS target_symbol,
+    rel.relationship_type
+FROM relationships rel
+JOIN symbols source
+    ON source.symbol_id = rel.source_symbol_id
+JOIN symbols target
+    ON target.symbol_id = rel.target_symbol_id
+JOIN repositories r
+    ON r.repo_id = rel.repo_id;
+
+
+
+
+INSERT INTO repository_versions (
+    repo_id,
+    commit_sha,
+    branch_name,
+    scan_status,
+    is_active,
+    started_at,
+    completed_at
+)
+SELECT
+    repo_id,
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    'main',
+    'COMPLETED',
+    TRUE,
+    NOW(),
+    NOW()
+FROM repositories
+WHERE full_name = 'ashirwad/AI-PR-Reviewer'
+
+UNION ALL
+
+SELECT
+    repo_id,
+    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    'main',
+    'COMPLETED',
+    TRUE,
+    NOW(),
+    NOW()
+FROM repositories
+WHERE full_name = 'ashirwad/Plant-Disease-Detection';
+
+
+
+
+SELECT
+    r.full_name,
+    rv.commit_sha,
+    rv.scan_status,
+    rv.is_active
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id;
+
+
+
+
+
+
+
+
+INSERT INTO scan_history (
+    repo_id,
+    commit_sha,
+    branch_name,
+    scan_type,
+    scan_status,
+    version_id,
+    started_at,
+    completed_at,
+    error_message
+)
+SELECT
+    rv.repo_id,
+    rv.commit_sha,
+    'main',
+    'INITIAL_SCAN',
+    'SUCCESS',
+    rv.version_id,
+    NOW(),
+    NOW(),
+    NULL
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+
+UNION ALL
+
+SELECT
+    rv.repo_id,
+    'cccccccccccccccccccccccccccccccccccccccc',
+    'main',
+    'INCREMENTAL_SCAN',
+    'FAILED',
+    NULL,
+    NOW(),
+    NOW(),
+    'Sample parsing failure'
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+
+UNION ALL
+
+SELECT
+    rv.repo_id,
+    rv.commit_sha,
+    'main',
+    'INITIAL_SCAN',
+    'SUCCESS',
+    rv.version_id,
+    NOW(),
+    NOW(),
+    NULL
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id
+WHERE r.full_name = 'ashirwad/Plant-Disease-Detection';
+
+
+
+
+SELECT
+    r.full_name,
+    sh.commit_sha,
+    sh.scan_status,
+    sh.version_id
+FROM scan_history sh
+JOIN repositories r ON r.repo_id = sh.repo_id
+ORDER BY r.full_name;
+
+
+
+
+
+INSERT INTO scan_history (
+    repo_id,
+    commit_sha,
+    branch_name,
+    scan_type,
+    scan_status,
+    version_id,
+    started_at,
+    completed_at,
+    error_message
+)
+SELECT
+    rv.repo_id,
+    rv.commit_sha,
+    'main',
+    'INITIAL_SCAN',
+    'SUCCESS',
+    rv.version_id,
+    NOW(),
+    NOW(),
+    NULL
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+
+UNION ALL
+
+SELECT
+    rv.repo_id,
+    'cccccccccccccccccccccccccccccccccccccccc',
+    'main',
+    'INCREMENTAL_SCAN',
+    'FAILED',
+    NULL,
+    NOW(),
+    NOW(),
+    'Sample parsing failure'
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+
+UNION ALL
+
+SELECT
+    rv.repo_id,
+    rv.commit_sha,
+    'main',
+    'INITIAL_SCAN',
+    'SUCCESS',
+    rv.version_id,
+    NOW(),
+    NOW(),
+    NULL
+FROM repository_versions rv
+JOIN repositories r ON r.repo_id = rv.repo_id
+WHERE r.full_name = 'ashirwad/Plant-Disease-Detection';
+
+
+INSERT INTO unresolved_references (
+    repo_id,
+    source_symbol_id,
+    reference_name,
+    reference_type,
+    line_number,
+    resolution_status
+)
+SELECT
+    s.repo_id,
+    s.symbol_id,
+    'obj.validate',
+    'CALL',
+    15,
+    'AMBIGUOUS'
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+WHERE r.full_name = 'ashirwad/AI-PR-Reviewer'
+AND s.qualified_name = 'AuthService.login'
+
+UNION ALL
+
+SELECT
+    s.repo_id,
+    s.symbol_id,
+    'model.transform',
+    'CALL',
+    25,
+    'UNRESOLVED'
+FROM symbols s
+JOIN repositories r ON r.repo_id = s.repo_id
+WHERE r.full_name = 'ashirwad/Plant-Disease-Detection'
+AND s.qualified_name = 'DiseaseClassifier.predict';
+
+
+
+
+SELECT
+    r.full_name,
+    s.qualified_name,
+    ur.reference_name,
+    ur.reference_type,
+    ur.resolution_status
+FROM unresolved_references ur
+JOIN repositories r ON r.repo_id = ur.repo_id
+JOIN symbols s ON s.symbol_id = ur.source_symbol_id;
+
+
+
+
+BEGIN;
+
+TRUNCATE TABLE
+    unresolved_references,
+    scan_history,
+    relationships,
+    symbols,
+    files,
+    repository_versions,
+    repository_database_registry,
+    user_repositories,
+    repositories,
+    users
+RESTART IDENTITY;
+
+COMMIT;
+
+
+
+SELECT
+    (SELECT COUNT(*) FROM users) AS users,
+    (SELECT COUNT(*) FROM repositories) AS repositories,
+    (SELECT COUNT(*) FROM user_repositories) AS user_repositories,
+    (SELECT COUNT(*) FROM repository_database_registry) AS registry,
+    (SELECT COUNT(*) FROM files) AS files,
+    (SELECT COUNT(*) FROM symbols) AS symbols,
+    (SELECT COUNT(*) FROM relationships) AS relationships,
+    (SELECT COUNT(*) FROM repository_versions) AS versions,
+    (SELECT COUNT(*) FROM scan_history) AS scan_history,
+    (SELECT COUNT(*) FROM unresolved_references) AS unresolved_references;
